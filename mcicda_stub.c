@@ -1,7 +1,7 @@
 /*
- * Stub MCI CD Audio Driver
- * Returns success for all operations and logs commands to a file
- * for external playback control.
+ * MCI CD Audio Driver with Direct Playback
+ * Intercepts CD audio commands and plays WAV files directly via MCI waveaudio.
+ * No external controller needed - audio plays through Wine's audio subsystem.
  */
 
 #include <windows.h>
@@ -16,8 +16,8 @@
 #define MCI_CLOSE_DRIVER 0x0802
 #endif
 
-/* Log file path - in the same directory as the DLL */
-#define LOG_FILE "C:\\mcicda_commands.log"
+/* Music directory - where track files are stored */
+#define MUSIC_DIR "C:\\music\\"
 
 /* Device state */
 static BOOL g_bOpen = FALSE;
@@ -27,15 +27,118 @@ static DWORD g_dwTimeFormat = MCI_FORMAT_TMSF;
 static BOOL g_bPlaying = FALSE;
 static BOOL g_bPaused = FALSE;
 
-/* Write a command to the log file */
-static void LogCommand(const char* cmd)
+/* MCI device ID for waveaudio playback */
+static MCIDEVICEID g_waveDeviceId = 0;
+
+/* Build path to track file */
+static void GetTrackPath(DWORD track, char* path, size_t pathSize)
 {
-    FILE* f = fopen(LOG_FILE, "a");
-    if (f) {
-        fprintf(f, "%s\n", cmd);
-        fflush(f);
-        fclose(f);
+    _snprintf(path, pathSize, "%strack%02d.wav", MUSIC_DIR, track);
+}
+
+/* Check if a track file exists */
+static BOOL TrackExists(DWORD track)
+{
+    char path[MAX_PATH];
+    GetTrackPath(track, path, MAX_PATH);
+    return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+}
+
+/* Stop current playback */
+static void StopPlayback(void)
+{
+    if (g_waveDeviceId) {
+        mciSendCommand(g_waveDeviceId, MCI_STOP, 0, 0);
+        mciSendCommand(g_waveDeviceId, MCI_CLOSE, 0, 0);
+        g_waveDeviceId = 0;
     }
+    g_bPlaying = FALSE;
+    g_bPaused = FALSE;
+}
+
+/* Play a track using MCI waveaudio */
+static BOOL PlayTrack(DWORD track)
+{
+    char path[MAX_PATH];
+    MCI_OPEN_PARMSA openParms;
+    MCI_PLAY_PARMS playParms;
+    MCIERROR err;
+
+    /* Stop any current playback */
+    StopPlayback();
+
+    /* Build track path */
+    GetTrackPath(track, path, MAX_PATH);
+
+    /* Check if file exists */
+    if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) {
+        return FALSE;
+    }
+
+    /* Open the wave file */
+    ZeroMemory(&openParms, sizeof(openParms));
+    openParms.lpstrDeviceType = "waveaudio";
+    openParms.lpstrElementName = path;
+
+    err = mciSendCommandA(0, MCI_OPEN,
+        MCI_OPEN_TYPE | MCI_OPEN_ELEMENT,
+        (DWORD_PTR)&openParms);
+
+    if (err != 0) {
+        return FALSE;
+    }
+
+    g_waveDeviceId = openParms.wDeviceID;
+
+    /* Start playback */
+    ZeroMemory(&playParms, sizeof(playParms));
+    err = mciSendCommand(g_waveDeviceId, MCI_PLAY, 0, (DWORD_PTR)&playParms);
+
+    if (err != 0) {
+        mciSendCommand(g_waveDeviceId, MCI_CLOSE, 0, 0);
+        g_waveDeviceId = 0;
+        return FALSE;
+    }
+
+    g_dwCurrentTrack = track;
+    g_bPlaying = TRUE;
+    g_bPaused = FALSE;
+
+    return TRUE;
+}
+
+/* Pause playback */
+static void PausePlayback(void)
+{
+    if (g_waveDeviceId && g_bPlaying && !g_bPaused) {
+        mciSendCommand(g_waveDeviceId, MCI_PAUSE, 0, 0);
+        g_bPaused = TRUE;
+    }
+}
+
+/* Resume playback */
+static void ResumePlayback(void)
+{
+    if (g_waveDeviceId && g_bPaused) {
+        mciSendCommand(g_waveDeviceId, MCI_RESUME, 0, 0);
+        g_bPaused = FALSE;
+    }
+}
+
+/* Count available tracks */
+static DWORD CountTracks(void)
+{
+    DWORD count = 0;
+    DWORD i;
+    for (i = 2; i <= 99; i++) {
+        if (TrackExists(i)) {
+            count++;
+        } else if (count > 0) {
+            /* Stop at first gap after finding tracks */
+            break;
+        }
+    }
+    return count > 0 ? count + 1 : 18; /* +1 for data track, default to 18 */
 }
 
 /* MCI driver procedure */
@@ -64,14 +167,13 @@ LRESULT CALLBACK DriverProc(DWORD_PTR dwDriverId, HDRVR hDriver, UINT msg,
     /* MCI commands */
     if (msg == MCI_OPEN_DRIVER) {
         g_bOpen = TRUE;
-        LogCommand("OPEN");
+        g_dwNumTracks = CountTracks();
         return 0;
     }
 
     if (msg == MCI_CLOSE_DRIVER) {
+        StopPlayback();
         g_bOpen = FALSE;
-        g_bPlaying = FALSE;
-        LogCommand("CLOSE");
         return 0;
     }
 
@@ -80,19 +182,16 @@ LRESULT CALLBACK DriverProc(DWORD_PTR dwDriverId, HDRVR hDriver, UINT msg,
 
     switch (msg) {
     case MCI_OPEN:
-        LogCommand("OPEN");
+        g_dwNumTracks = CountTracks();
         return 0;
 
     case MCI_CLOSE:
-        g_bPlaying = FALSE;
-        LogCommand("CLOSE");
+        StopPlayback();
         return 0;
 
     case MCI_PLAY:
         {
-            char buf[64];
             DWORD dwFrom = g_dwCurrentTrack;
-            DWORD dwTo = g_dwNumTracks;
 
             if (lParam1 & MCI_FROM) {
                 MCI_PLAY_PARMS* parms = (MCI_PLAY_PARMS*)lParam2;
@@ -101,46 +200,25 @@ LRESULT CALLBACK DriverProc(DWORD_PTR dwDriverId, HDRVR hDriver, UINT msg,
                 else
                     dwFrom = parms->dwFrom;
             }
-            if (lParam1 & MCI_TO) {
-                MCI_PLAY_PARMS* parms = (MCI_PLAY_PARMS*)lParam2;
-                if (g_dwTimeFormat == MCI_FORMAT_TMSF)
-                    dwTo = MCI_TMSF_TRACK(parms->dwTo);
-                else
-                    dwTo = parms->dwTo;
-            }
 
-            g_dwCurrentTrack = dwFrom;
-            g_bPlaying = TRUE;
-            g_bPaused = FALSE;
-
-            sprintf(buf, "PLAY %d %d", dwFrom, dwTo);
-            LogCommand(buf);
+            PlayTrack(dwFrom);
         }
         return 0;
 
     case MCI_STOP:
-        g_bPlaying = FALSE;
-        g_bPaused = FALSE;
-        LogCommand("STOP");
+        StopPlayback();
         return 0;
 
     case MCI_PAUSE:
-        if (g_bPlaying) {
-            g_bPaused = TRUE;
-            LogCommand("PAUSE");
-        }
+        PausePlayback();
         return 0;
 
     case MCI_RESUME:
-        if (g_bPaused) {
-            g_bPaused = FALSE;
-            LogCommand("RESUME");
-        }
+        ResumePlayback();
         return 0;
 
     case MCI_SEEK:
         {
-            char buf[64];
             if (lParam1 & MCI_TO) {
                 MCI_SEEK_PARMS* parms = (MCI_SEEK_PARMS*)lParam2;
                 DWORD dwTrack;
@@ -149,8 +227,6 @@ LRESULT CALLBACK DriverProc(DWORD_PTR dwDriverId, HDRVR hDriver, UINT msg,
                 else
                     dwTrack = parms->dwTo;
                 g_dwCurrentTrack = dwTrack;
-                sprintf(buf, "SEEK %d", dwTrack);
-                LogCommand(buf);
             }
         }
         return 0;
@@ -260,11 +336,9 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
     switch (fdwReason) {
     case DLL_PROCESS_ATTACH:
         DisableThreadLibraryCalls(hinstDLL);
-        /* Clear the log file on load */
-        {
-            FILE* f = fopen(LOG_FILE, "w");
-            if (f) fclose(f);
-        }
+        break;
+    case DLL_PROCESS_DETACH:
+        StopPlayback();
         break;
     }
     return TRUE;
