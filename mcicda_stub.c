@@ -8,6 +8,14 @@
 #include <mmsystem.h>
 #include <stdio.h>
 
+/* Internal MCI driver message IDs (not in standard headers) */
+#ifndef MCI_OPEN_DRIVER
+#define MCI_OPEN_DRIVER 0x0801
+#endif
+#ifndef MCI_CLOSE_DRIVER
+#define MCI_CLOSE_DRIVER 0x0802
+#endif
+
 /* Log file path - in the same directory as the DLL */
 #define LOG_FILE "C:\\mcicda_commands.log"
 
