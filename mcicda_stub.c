@@ -1,6 +1,7 @@
 /*
- * MCI CD Audio Driver with Direct waveOut Playback
- * Intercepts CD audio commands and plays WAV files using waveOut API.
+ * MCI CD Audio Driver with Direct Multi-Format Playback
+ * Intercepts CD audio commands and plays audio files using waveOut API.
+ * Supports WAV, FLAC, MP3, and OGG Vorbis via single-header decoders.
  * Uses dynamic loading of winmm.dll to avoid import issues.
  */
 
@@ -8,6 +9,19 @@
 #include <mmsystem.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <string.h>
+
+/* Single-header audio decoders - implementations */
+#define DR_WAV_IMPLEMENTATION
+#include "dr_wav.h"
+
+#define DR_FLAC_IMPLEMENTATION
+#include "dr_flac.h"
+
+#define DR_MP3_IMPLEMENTATION
+#include "dr_mp3.h"
+
+#include "stb_vorbis.c"
 
 /* Internal MCI driver message IDs */
 #ifndef MCI_OPEN_DRIVER
@@ -20,6 +34,18 @@
 /* Paths */
 #define MUSIC_DIR "C:\\music\\"
 #define LOG_FILE "C:\\mcicda_commands.log"
+
+/* Supported audio formats */
+typedef enum {
+    AUDIO_FMT_UNKNOWN = 0,
+    AUDIO_FMT_WAV,
+    AUDIO_FMT_FLAC,
+    AUDIO_FMT_MP3,
+    AUDIO_FMT_OGG
+} AudioFormat;
+
+static const char* g_extensions[] = { ".wav", ".flac", ".mp3", ".ogg", NULL };
+static const AudioFormat g_formats[] = { AUDIO_FMT_WAV, AUDIO_FMT_FLAC, AUDIO_FMT_MP3, AUDIO_FMT_OGG };
 
 /* Device state */
 static BOOL g_bOpen = FALSE;
@@ -103,18 +129,87 @@ static BOOL InitWinMM(void)
     return TRUE;
 }
 
-/* Build path to track file */
-static void GetTrackPath(DWORD track, char* path, size_t pathSize)
+/* Build path to track file, trying multiple extensions.
+ * Returns the detected format, or AUDIO_FMT_UNKNOWN if no file found. */
+static AudioFormat GetTrackPath(DWORD track, char* path, size_t pathSize)
 {
-    _snprintf(path, pathSize, "%strack%02d.wav", MUSIC_DIR, track);
+    int i;
+    for (i = 0; g_extensions[i] != NULL; i++) {
+        _snprintf(path, pathSize, "%strack%02d%s", MUSIC_DIR, track, g_extensions[i]);
+        if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) {
+            return g_formats[i];
+        }
+    }
+    /* No file found */
+    path[0] = '\0';
+    return AUDIO_FMT_UNKNOWN;
 }
 
-/* Check if track exists */
+/* Check if track exists in any supported format */
 static BOOL TrackExists(DWORD track)
 {
     char path[MAX_PATH];
-    GetTrackPath(track, path, MAX_PATH);
-    return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+    return GetTrackPath(track, path, MAX_PATH) != AUDIO_FMT_UNKNOWN;
+}
+
+/* Decode audio file to 16-bit PCM.
+ * Returns allocated buffer (caller must free), or NULL on failure.
+ * Sets channels, sampleRate, and totalSamples (total int16 samples = frames * channels). */
+static short* DecodeAudioFile(const char* path, AudioFormat fmt,
+                              unsigned int* channels, unsigned int* sampleRate,
+                              size_t* totalSamples)
+{
+    short* pcm = NULL;
+
+    switch (fmt) {
+    case AUDIO_FMT_WAV: {
+        drwav_uint64 frameCount = 0;
+        pcm = drwav_open_file_and_read_pcm_frames_s16(path, channels, sampleRate, &frameCount, NULL);
+        if (pcm) {
+            *totalSamples = (size_t)(frameCount * (*channels));
+            LogCommand("Decoded WAV: %uch %uHz, %llu frames", *channels, *sampleRate, (unsigned long long)frameCount);
+        }
+        break;
+    }
+    case AUDIO_FMT_FLAC: {
+        drflac_uint64 frameCount = 0;
+        pcm = drflac_open_file_and_read_pcm_frames_s16(path, channels, sampleRate, &frameCount, NULL);
+        if (pcm) {
+            *totalSamples = (size_t)(frameCount * (*channels));
+            LogCommand("Decoded FLAC: %uch %uHz, %llu frames", *channels, *sampleRate, (unsigned long long)frameCount);
+        }
+        break;
+    }
+    case AUDIO_FMT_MP3: {
+        drmp3_config config = {0};
+        drmp3_uint64 frameCount = 0;
+        pcm = drmp3_open_file_and_read_pcm_frames_s16(path, &config, &frameCount, NULL);
+        if (pcm) {
+            *channels = config.channels;
+            *sampleRate = config.sampleRate;
+            *totalSamples = (size_t)(frameCount * config.channels);
+            LogCommand("Decoded MP3: %uch %uHz, %llu frames", *channels, *sampleRate, (unsigned long long)frameCount);
+        }
+        break;
+    }
+    case AUDIO_FMT_OGG: {
+        int ch = 0, sr = 0;
+        short* output = NULL;
+        int sampleFrames = stb_vorbis_decode_filename(path, &ch, &sr, &output);
+        if (sampleFrames > 0 && output) {
+            pcm = output;
+            *channels = (unsigned int)ch;
+            *sampleRate = (unsigned int)sr;
+            *totalSamples = (size_t)sampleFrames * (size_t)ch;
+            LogCommand("Decoded OGG: %uch %uHz, %d frames", *channels, *sampleRate, sampleFrames);
+        }
+        break;
+    }
+    default:
+        break;
+    }
+
+    return pcm;
 }
 
 /* Stop current playback */
@@ -148,87 +243,57 @@ static void StopPlayback(void)
     g_bStopRequested = FALSE;
 }
 
+/* Playback thread argument */
+typedef struct {
+    char path[MAX_PATH];
+    AudioFormat format;
+} PlaybackArgs;
+
 /* Playback thread */
 static DWORD WINAPI PlaybackThread(LPVOID param)
 {
-    char* path = (char*)param;
-    HANDLE hFile;
-    DWORD dwRead;
-    BYTE header[44];
+    PlaybackArgs* args = (PlaybackArgs*)param;
+    unsigned int channels = 0, sampleRate = 0;
+    size_t totalSamples = 0;
+    short* pcmData;
     WAVEFORMATEX wfx;
     DWORD dataSize;
     MMRESULT result;
 
-    LogCommand("PlaybackThread: %s", path);
+    LogCommand("PlaybackThread: %s", args->path);
 
     if (!InitWinMM()) {
-        free(path);
+        free(args);
         return 1;
     }
 
-    /* Open WAV file */
-    hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
-                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        LogCommand("ERROR: Cannot open %s", path);
-        free(path);
+    /* Decode audio to PCM */
+    pcmData = DecodeAudioFile(args->path, args->format, &channels, &sampleRate, &totalSamples);
+    if (!pcmData) {
+        LogCommand("ERROR: Failed to decode %s", args->path);
+        free(args);
         return 1;
     }
 
-    /* Read WAV header */
-    if (!ReadFile(hFile, header, 44, &dwRead, NULL) || dwRead < 44) {
-        LogCommand("ERROR: Cannot read WAV header");
-        CloseHandle(hFile);
-        free(path);
-        return 1;
-    }
+    dataSize = (DWORD)(totalSamples * sizeof(short));
+    g_pAudioData = (BYTE*)pcmData;
 
-    /* Verify RIFF/WAVE */
-    if (memcmp(header, "RIFF", 4) != 0 || memcmp(header + 8, "WAVE", 4) != 0) {
-        LogCommand("ERROR: Not a valid WAV file");
-        CloseHandle(hFile);
-        free(path);
-        return 1;
-    }
-
-    /* Parse format */
-    wfx.wFormatTag = *(WORD*)(header + 20);
-    wfx.nChannels = *(WORD*)(header + 22);
-    wfx.nSamplesPerSec = *(DWORD*)(header + 24);
-    wfx.nAvgBytesPerSec = *(DWORD*)(header + 28);
-    wfx.nBlockAlign = *(WORD*)(header + 32);
-    wfx.wBitsPerSample = *(WORD*)(header + 34);
+    /* Set up waveOut format (16-bit PCM) */
+    wfx.wFormatTag = WAVE_FORMAT_PCM;
+    wfx.nChannels = (WORD)channels;
+    wfx.nSamplesPerSec = sampleRate;
+    wfx.wBitsPerSample = 16;
+    wfx.nBlockAlign = (WORD)(channels * 2);
+    wfx.nAvgBytesPerSec = sampleRate * channels * 2;
     wfx.cbSize = 0;
 
-    dataSize = *(DWORD*)(header + 40);
-
-    LogCommand("WAV: %dch %dHz %dbit %d bytes", wfx.nChannels, wfx.nSamplesPerSec, wfx.wBitsPerSample, dataSize);
-
-    /* Allocate buffer */
-    g_pAudioData = (BYTE*)malloc(dataSize);
-    if (!g_pAudioData) {
-        LogCommand("ERROR: malloc failed");
-        CloseHandle(hFile);
-        free(path);
-        return 1;
-    }
-
-    /* Read audio data */
-    if (!ReadFile(hFile, g_pAudioData, dataSize, &dwRead, NULL)) {
-        LogCommand("ERROR: Read failed");
-        CloseHandle(hFile);
-        free(path);
-        free(g_pAudioData);
-        g_pAudioData = NULL;
-        return 1;
-    }
-    CloseHandle(hFile);
+    LogCommand("PCM: %dch %dHz 16bit %d bytes", channels, sampleRate, dataSize);
 
     /* Open waveOut */
     result = pWaveOutOpen(&g_hWaveOut, WAVE_MAPPER, &wfx, 0, 0, CALLBACK_NULL);
     if (result != MMSYSERR_NOERROR) {
         LogCommand("ERROR: waveOutOpen failed %d", result);
-        free(path);
+        free(args);
         free(g_pAudioData);
         g_pAudioData = NULL;
         return 1;
@@ -236,7 +301,7 @@ static DWORD WINAPI PlaybackThread(LPVOID param)
 
     /* Prepare header */
     g_waveHdr.lpData = (LPSTR)g_pAudioData;
-    g_waveHdr.dwBufferLength = dwRead;
+    g_waveHdr.dwBufferLength = dataSize;
     g_waveHdr.dwFlags = 0;
 
     result = pWaveOutPrepareHeader(g_hWaveOut, &g_waveHdr, sizeof(WAVEHDR));
@@ -244,7 +309,7 @@ static DWORD WINAPI PlaybackThread(LPVOID param)
         LogCommand("ERROR: waveOutPrepareHeader failed");
         pWaveOutClose(g_hWaveOut);
         g_hWaveOut = NULL;
-        free(path);
+        free(args);
         free(g_pAudioData);
         g_pAudioData = NULL;
         return 1;
@@ -257,7 +322,7 @@ static DWORD WINAPI PlaybackThread(LPVOID param)
         pWaveOutUnprepareHeader(g_hWaveOut, &g_waveHdr, sizeof(WAVEHDR));
         pWaveOutClose(g_hWaveOut);
         g_hWaveOut = NULL;
-        free(path);
+        free(args);
         free(g_pAudioData);
         g_pAudioData = NULL;
         return 1;
@@ -275,7 +340,7 @@ static DWORD WINAPI PlaybackThread(LPVOID param)
         Sleep(100);
     }
 
-    free(path);
+    free(args);
     return 0;
 }
 
@@ -283,28 +348,33 @@ static DWORD WINAPI PlaybackThread(LPVOID param)
 static BOOL PlayTrack(DWORD track)
 {
     char path[MAX_PATH];
-    char* pathCopy;
+    AudioFormat fmt;
+    PlaybackArgs* args;
 
     StopPlayback();
 
-    GetTrackPath(track, path, MAX_PATH);
+    fmt = GetTrackPath(track, path, MAX_PATH);
     LogCommand("PLAY %d (%s)", track, path);
 
-    if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) {
-        LogCommand("ERROR: File not found");
+    if (fmt == AUDIO_FMT_UNKNOWN) {
+        LogCommand("ERROR: No audio file found for track %d", track);
         return FALSE;
     }
 
-    pathCopy = _strdup(path);
-    if (!pathCopy) return FALSE;
+    args = (PlaybackArgs*)malloc(sizeof(PlaybackArgs));
+    if (!args) return FALSE;
+
+    strncpy(args->path, path, MAX_PATH - 1);
+    args->path[MAX_PATH - 1] = '\0';
+    args->format = fmt;
 
     g_dwCurrentTrack = track;
     g_bStopRequested = FALSE;
 
-    g_hPlayThread = CreateThread(NULL, 0, PlaybackThread, pathCopy, 0, NULL);
+    g_hPlayThread = CreateThread(NULL, 0, PlaybackThread, args, 0, NULL);
     if (!g_hPlayThread) {
         LogCommand("ERROR: CreateThread failed");
-        free(pathCopy);
+        free(args);
         return FALSE;
     }
 
