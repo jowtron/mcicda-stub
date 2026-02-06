@@ -10,7 +10,7 @@ Games call the Windows MCI CD Audio API to play music. This DLL intercepts those
 Game (MCI API)  --->  mcicda.dll (this)  --->  waveOut  --->  Audio output
                            |
                       Decodes from:
-                      WAV, FLAC, MP3, OGG
+                      WAV, FLAC, MP3, OGG, Opus
                            |
                       C:\music\track02.wav
                       C:\music\track03.flac
@@ -26,10 +26,11 @@ Game (MCI API)  --->  mcicda.dll (this)  --->  waveOut  --->  Audio output
 | FLAC | `.flac` | [dr_flac](https://github.com/mackron/dr_libs) |
 | MP3 | `.mp3` | [dr_mp3](https://github.com/mackron/dr_libs) |
 | OGG Vorbis | `.ogg` | [stb_vorbis](https://github.com/nothings/stb) |
+| Opus | `.opus` | [libopus](https://github.com/xiph/opus) + [opusfile](https://github.com/xiph/opusfile) |
 
-All decoders are public domain single-header libraries compiled directly into the DLL. No external dependencies.
+All decoders are compiled directly into the DLL. No external dependencies. WAV/FLAC/MP3/OGG decoders are public domain single-header libraries. Opus uses the BSD-licensed Xiph reference libraries (libogg, libopus, opusfile) vendored as source.
 
-For each track, the DLL searches for files in priority order: `.wav`, `.flac`, `.mp3`, `.ogg`. You can mix formats -- e.g. `track02.flac` and `track03.mp3` in the same directory.
+For each track, the DLL searches for files in priority order: `.wav`, `.flac`, `.mp3`, `.ogg`, `.opus`. You can mix formats -- e.g. `track02.flac` and `track03.opus` in the same directory.
 
 ## Installation
 
@@ -122,7 +123,7 @@ MCI_OPEN, MCI_CLOSE, MCI_PLAY, MCI_STOP, MCI_PAUSE, MCI_RESUME, MCI_SEEK, MCI_ST
 
 ### Audio Pipeline
 1. Game sends MCI_PLAY with track number
-2. DLL searches `C:\music\trackNN.{wav,flac,mp3,ogg}`
+2. DLL searches `C:\music\trackNN.{wav,flac,mp3,ogg,opus}`
 3. Matched file is decoded to 16-bit PCM in memory using the appropriate decoder
 4. PCM data is played via waveOut API (dynamically loaded from winmm.dll)
 
@@ -130,7 +131,7 @@ MCI_OPEN, MCI_CLOSE, MCI_PLAY, MCI_STOP, MCI_PAUSE, MCI_RESUME, MCI_SEEK, MCI_ST
 
 MIT License -- See LICENSE file.
 
-Audio decoder libraries are public domain (dr_libs, stb_vorbis).
+Audio decoder libraries are public domain (dr_libs, stb_vorbis) and BSD-licensed (libogg, libopus, opusfile).
 
 ## Contributing
 
