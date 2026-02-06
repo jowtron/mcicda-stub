@@ -1,15 +1,13 @@
 /*
  * MCI CD Audio Driver with Direct waveOut Playback
  * Intercepts CD audio commands and plays WAV files using waveOut API.
- * No external controller needed.
+ * Uses dynamic loading of winmm.dll to avoid import issues.
  */
 
 #include <windows.h>
 #include <mmsystem.h>
 #include <stdio.h>
 #include <stdarg.h>
-
-#pragma comment(lib, "winmm.lib")
 
 /* Internal MCI driver message IDs */
 #ifndef MCI_OPEN_DRIVER
@@ -19,9 +17,9 @@
 #define MCI_CLOSE_DRIVER 0x0802
 #endif
 
-/* Music directory */
+/* Paths */
 #define MUSIC_DIR "C:\\music\\"
-#define DEBUG_LOG "C:\\mcicda_debug.log"
+#define LOG_FILE "C:\\mcicda_commands.log"
 
 /* Device state */
 static BOOL g_bOpen = FALSE;
@@ -32,16 +30,36 @@ static BOOL g_bPlaying = FALSE;
 static BOOL g_bPaused = FALSE;
 
 /* Audio playback state */
+static HMODULE g_hWinMM = NULL;
 static HWAVEOUT g_hWaveOut = NULL;
 static WAVEHDR g_waveHdr = {0};
 static BYTE* g_pAudioData = NULL;
 static HANDLE g_hPlayThread = NULL;
 static volatile BOOL g_bStopRequested = FALSE;
 
-/* Debug logging */
-static void DebugLog(const char* fmt, ...)
+/* Function pointers for winmm.dll */
+typedef MMRESULT (WINAPI *pfnWaveOutOpen)(LPHWAVEOUT, UINT, LPCWAVEFORMATEX, DWORD_PTR, DWORD_PTR, DWORD);
+typedef MMRESULT (WINAPI *pfnWaveOutClose)(HWAVEOUT);
+typedef MMRESULT (WINAPI *pfnWaveOutPrepareHeader)(HWAVEOUT, LPWAVEHDR, UINT);
+typedef MMRESULT (WINAPI *pfnWaveOutUnprepareHeader)(HWAVEOUT, LPWAVEHDR, UINT);
+typedef MMRESULT (WINAPI *pfnWaveOutWrite)(HWAVEOUT, LPWAVEHDR, UINT);
+typedef MMRESULT (WINAPI *pfnWaveOutReset)(HWAVEOUT);
+typedef MMRESULT (WINAPI *pfnWaveOutPause)(HWAVEOUT);
+typedef MMRESULT (WINAPI *pfnWaveOutRestart)(HWAVEOUT);
+
+static pfnWaveOutOpen pWaveOutOpen = NULL;
+static pfnWaveOutClose pWaveOutClose = NULL;
+static pfnWaveOutPrepareHeader pWaveOutPrepareHeader = NULL;
+static pfnWaveOutUnprepareHeader pWaveOutUnprepareHeader = NULL;
+static pfnWaveOutWrite pWaveOutWrite = NULL;
+static pfnWaveOutReset pWaveOutReset = NULL;
+static pfnWaveOutPause pWaveOutPause = NULL;
+static pfnWaveOutRestart pWaveOutRestart = NULL;
+
+/* Write a command to the log file */
+static void LogCommand(const char* fmt, ...)
 {
-    FILE* f = fopen(DEBUG_LOG, "a");
+    FILE* f = fopen(LOG_FILE, "a");
     if (f) {
         va_list args;
         va_start(args, fmt);
@@ -51,6 +69,38 @@ static void DebugLog(const char* fmt, ...)
         fflush(f);
         fclose(f);
     }
+}
+
+/* Initialize winmm.dll function pointers */
+static BOOL InitWinMM(void)
+{
+    if (g_hWinMM) return TRUE;
+
+    g_hWinMM = LoadLibraryA("winmm.dll");
+    if (!g_hWinMM) {
+        LogCommand("ERROR: Cannot load winmm.dll");
+        return FALSE;
+    }
+
+    pWaveOutOpen = (pfnWaveOutOpen)GetProcAddress(g_hWinMM, "waveOutOpen");
+    pWaveOutClose = (pfnWaveOutClose)GetProcAddress(g_hWinMM, "waveOutClose");
+    pWaveOutPrepareHeader = (pfnWaveOutPrepareHeader)GetProcAddress(g_hWinMM, "waveOutPrepareHeader");
+    pWaveOutUnprepareHeader = (pfnWaveOutUnprepareHeader)GetProcAddress(g_hWinMM, "waveOutUnprepareHeader");
+    pWaveOutWrite = (pfnWaveOutWrite)GetProcAddress(g_hWinMM, "waveOutWrite");
+    pWaveOutReset = (pfnWaveOutReset)GetProcAddress(g_hWinMM, "waveOutReset");
+    pWaveOutPause = (pfnWaveOutPause)GetProcAddress(g_hWinMM, "waveOutPause");
+    pWaveOutRestart = (pfnWaveOutRestart)GetProcAddress(g_hWinMM, "waveOutRestart");
+
+    if (!pWaveOutOpen || !pWaveOutClose || !pWaveOutPrepareHeader ||
+        !pWaveOutUnprepareHeader || !pWaveOutWrite || !pWaveOutReset) {
+        LogCommand("ERROR: Cannot get winmm function pointers");
+        FreeLibrary(g_hWinMM);
+        g_hWinMM = NULL;
+        return FALSE;
+    }
+
+    LogCommand("winmm.dll loaded successfully");
+    return TRUE;
 }
 
 /* Build path to track file */
@@ -78,12 +128,12 @@ static void StopPlayback(void)
         g_hPlayThread = NULL;
     }
 
-    if (g_hWaveOut) {
-        waveOutReset(g_hWaveOut);
+    if (g_hWaveOut && pWaveOutReset && pWaveOutUnprepareHeader && pWaveOutClose) {
+        pWaveOutReset(g_hWaveOut);
         if (g_waveHdr.dwFlags & WHDR_PREPARED) {
-            waveOutUnprepareHeader(g_hWaveOut, &g_waveHdr, sizeof(WAVEHDR));
+            pWaveOutUnprepareHeader(g_hWaveOut, &g_waveHdr, sizeof(WAVEHDR));
         }
-        waveOutClose(g_hWaveOut);
+        pWaveOutClose(g_hWaveOut);
         g_hWaveOut = NULL;
     }
 
@@ -109,20 +159,25 @@ static DWORD WINAPI PlaybackThread(LPVOID param)
     DWORD dataSize;
     MMRESULT result;
 
-    DebugLog("PlaybackThread started for: %s", path);
+    LogCommand("PlaybackThread: %s", path);
+
+    if (!InitWinMM()) {
+        free(path);
+        return 1;
+    }
 
     /* Open WAV file */
     hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
                         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE) {
-        DebugLog("ERROR: Cannot open file (error %d)", GetLastError());
+        LogCommand("ERROR: Cannot open %s", path);
         free(path);
         return 1;
     }
 
     /* Read WAV header */
     if (!ReadFile(hFile, header, 44, &dwRead, NULL) || dwRead < 44) {
-        DebugLog("ERROR: Cannot read WAV header");
+        LogCommand("ERROR: Cannot read WAV header");
         CloseHandle(hFile);
         free(path);
         return 1;
@@ -130,13 +185,13 @@ static DWORD WINAPI PlaybackThread(LPVOID param)
 
     /* Verify RIFF/WAVE */
     if (memcmp(header, "RIFF", 4) != 0 || memcmp(header + 8, "WAVE", 4) != 0) {
-        DebugLog("ERROR: Not a valid WAV file");
+        LogCommand("ERROR: Not a valid WAV file");
         CloseHandle(hFile);
         free(path);
         return 1;
     }
 
-    /* Parse format (assuming PCM at offset 20) */
+    /* Parse format */
     wfx.wFormatTag = *(WORD*)(header + 20);
     wfx.nChannels = *(WORD*)(header + 22);
     wfx.nSamplesPerSec = *(DWORD*)(header + 24);
@@ -147,13 +202,12 @@ static DWORD WINAPI PlaybackThread(LPVOID param)
 
     dataSize = *(DWORD*)(header + 40);
 
-    DebugLog("WAV format: %d ch, %d Hz, %d bit, %d bytes",
-             wfx.nChannels, wfx.nSamplesPerSec, wfx.wBitsPerSample, dataSize);
+    LogCommand("WAV: %dch %dHz %dbit %d bytes", wfx.nChannels, wfx.nSamplesPerSec, wfx.wBitsPerSample, dataSize);
 
-    /* Allocate buffer for audio data */
+    /* Allocate buffer */
     g_pAudioData = (BYTE*)malloc(dataSize);
     if (!g_pAudioData) {
-        DebugLog("ERROR: Cannot allocate %d bytes", dataSize);
+        LogCommand("ERROR: malloc failed");
         CloseHandle(hFile);
         free(path);
         return 1;
@@ -161,7 +215,7 @@ static DWORD WINAPI PlaybackThread(LPVOID param)
 
     /* Read audio data */
     if (!ReadFile(hFile, g_pAudioData, dataSize, &dwRead, NULL)) {
-        DebugLog("ERROR: Cannot read audio data");
+        LogCommand("ERROR: Read failed");
         CloseHandle(hFile);
         free(path);
         free(g_pAudioData);
@@ -170,29 +224,25 @@ static DWORD WINAPI PlaybackThread(LPVOID param)
     }
     CloseHandle(hFile);
 
-    DebugLog("Read %d bytes of audio data", dwRead);
-
-    /* Open waveOut device */
-    result = waveOutOpen(&g_hWaveOut, WAVE_MAPPER, &wfx, 0, 0, CALLBACK_NULL);
+    /* Open waveOut */
+    result = pWaveOutOpen(&g_hWaveOut, WAVE_MAPPER, &wfx, 0, 0, CALLBACK_NULL);
     if (result != MMSYSERR_NOERROR) {
-        DebugLog("ERROR: waveOutOpen failed (error %d)", result);
+        LogCommand("ERROR: waveOutOpen failed %d", result);
         free(path);
         free(g_pAudioData);
         g_pAudioData = NULL;
         return 1;
     }
-
-    DebugLog("waveOutOpen success");
 
     /* Prepare header */
     g_waveHdr.lpData = (LPSTR)g_pAudioData;
     g_waveHdr.dwBufferLength = dwRead;
     g_waveHdr.dwFlags = 0;
 
-    result = waveOutPrepareHeader(g_hWaveOut, &g_waveHdr, sizeof(WAVEHDR));
+    result = pWaveOutPrepareHeader(g_hWaveOut, &g_waveHdr, sizeof(WAVEHDR));
     if (result != MMSYSERR_NOERROR) {
-        DebugLog("ERROR: waveOutPrepareHeader failed (error %d)", result);
-        waveOutClose(g_hWaveOut);
+        LogCommand("ERROR: waveOutPrepareHeader failed");
+        pWaveOutClose(g_hWaveOut);
         g_hWaveOut = NULL;
         free(path);
         free(g_pAudioData);
@@ -200,12 +250,12 @@ static DWORD WINAPI PlaybackThread(LPVOID param)
         return 1;
     }
 
-    /* Write data to start playback */
-    result = waveOutWrite(g_hWaveOut, &g_waveHdr, sizeof(WAVEHDR));
+    /* Start playback */
+    result = pWaveOutWrite(g_hWaveOut, &g_waveHdr, sizeof(WAVEHDR));
     if (result != MMSYSERR_NOERROR) {
-        DebugLog("ERROR: waveOutWrite failed (error %d)", result);
-        waveOutUnprepareHeader(g_hWaveOut, &g_waveHdr, sizeof(WAVEHDR));
-        waveOutClose(g_hWaveOut);
+        LogCommand("ERROR: waveOutWrite failed");
+        pWaveOutUnprepareHeader(g_hWaveOut, &g_waveHdr, sizeof(WAVEHDR));
+        pWaveOutClose(g_hWaveOut);
         g_hWaveOut = NULL;
         free(path);
         free(g_pAudioData);
@@ -213,20 +263,19 @@ static DWORD WINAPI PlaybackThread(LPVOID param)
         return 1;
     }
 
-    DebugLog("waveOutWrite success - playback started");
+    LogCommand("PLAYING");
     g_bPlaying = TRUE;
 
-    /* Wait for playback to complete or stop request */
+    /* Wait for completion */
     while (!g_bStopRequested) {
         if (g_waveHdr.dwFlags & WHDR_DONE) {
-            DebugLog("Playback completed");
+            LogCommand("PLAYBACK_DONE");
             break;
         }
         Sleep(100);
     }
 
     free(path);
-    DebugLog("PlaybackThread exiting");
     return 0;
 }
 
@@ -236,57 +285,49 @@ static BOOL PlayTrack(DWORD track)
     char path[MAX_PATH];
     char* pathCopy;
 
-    DebugLog("PlayTrack called for track %d", track);
-
     StopPlayback();
 
     GetTrackPath(track, path, MAX_PATH);
-    DebugLog("Track path: %s", path);
+    LogCommand("PLAY %d (%s)", track, path);
 
     if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) {
-        DebugLog("ERROR: File not found");
+        LogCommand("ERROR: File not found");
         return FALSE;
     }
 
-    /* Copy path for thread */
     pathCopy = _strdup(path);
-    if (!pathCopy) {
-        DebugLog("ERROR: Cannot allocate path");
-        return FALSE;
-    }
+    if (!pathCopy) return FALSE;
 
     g_dwCurrentTrack = track;
     g_bStopRequested = FALSE;
 
-    /* Start playback thread */
     g_hPlayThread = CreateThread(NULL, 0, PlaybackThread, pathCopy, 0, NULL);
     if (!g_hPlayThread) {
-        DebugLog("ERROR: Cannot create playback thread");
+        LogCommand("ERROR: CreateThread failed");
         free(pathCopy);
         return FALSE;
     }
 
-    DebugLog("Playback thread created");
     return TRUE;
 }
 
 /* Pause playback */
 static void PausePlayback(void)
 {
-    if (g_hWaveOut && g_bPlaying && !g_bPaused) {
-        waveOutPause(g_hWaveOut);
+    if (g_hWaveOut && pWaveOutPause && g_bPlaying && !g_bPaused) {
+        pWaveOutPause(g_hWaveOut);
         g_bPaused = TRUE;
-        DebugLog("Paused");
+        LogCommand("PAUSE");
     }
 }
 
 /* Resume playback */
 static void ResumePlayback(void)
 {
-    if (g_hWaveOut && g_bPaused) {
-        waveOutRestart(g_hWaveOut);
+    if (g_hWaveOut && pWaveOutRestart && g_bPaused) {
+        pWaveOutRestart(g_hWaveOut);
         g_bPaused = FALSE;
-        DebugLog("Resumed");
+        LogCommand("RESUME");
     }
 }
 
@@ -325,12 +366,12 @@ LRESULT CALLBACK DriverProc(DWORD_PTR dwDriverId, HDRVR hDriver, UINT msg,
     if (msg == MCI_OPEN_DRIVER) {
         g_bOpen = TRUE;
         g_dwNumTracks = CountTracks();
-        DebugLog("MCI_OPEN_DRIVER: %d tracks", g_dwNumTracks);
+        LogCommand("OPEN (%d tracks)", g_dwNumTracks);
         return 0;
     }
 
     if (msg == MCI_CLOSE_DRIVER) {
-        DebugLog("MCI_CLOSE_DRIVER");
+        LogCommand("CLOSE");
         StopPlayback();
         g_bOpen = FALSE;
         return 0;
@@ -341,18 +382,17 @@ LRESULT CALLBACK DriverProc(DWORD_PTR dwDriverId, HDRVR hDriver, UINT msg,
 
     switch (msg) {
     case MCI_OPEN:
-        DebugLog("MCI_OPEN");
+        LogCommand("MCI_OPEN");
         return 0;
 
     case MCI_CLOSE:
-        DebugLog("MCI_CLOSE");
+        LogCommand("MCI_CLOSE");
         StopPlayback();
         return 0;
 
     case MCI_PLAY:
         {
             DWORD dwFrom = g_dwCurrentTrack;
-            DebugLog("MCI_PLAY received");
 
             if (lParam1 & MCI_FROM) {
                 MCI_PLAY_PARMS* parms = (MCI_PLAY_PARMS*)lParam2;
@@ -362,23 +402,20 @@ LRESULT CALLBACK DriverProc(DWORD_PTR dwDriverId, HDRVR hDriver, UINT msg,
                     dwFrom = parms->dwFrom;
             }
 
-            DebugLog("Playing track %d", dwFrom);
             PlayTrack(dwFrom);
         }
         return 0;
 
     case MCI_STOP:
-        DebugLog("MCI_STOP");
+        LogCommand("STOP");
         StopPlayback();
         return 0;
 
     case MCI_PAUSE:
-        DebugLog("MCI_PAUSE");
         PausePlayback();
         return 0;
 
     case MCI_RESUME:
-        DebugLog("MCI_RESUME");
         ResumePlayback();
         return 0;
 
@@ -391,7 +428,7 @@ LRESULT CALLBACK DriverProc(DWORD_PTR dwDriverId, HDRVR hDriver, UINT msg,
             else
                 dwTrack = parms->dwTo;
             g_dwCurrentTrack = dwTrack;
-            DebugLog("MCI_SEEK to track %d", dwTrack);
+            LogCommand("SEEK %d", dwTrack);
         }
         return 0;
 
@@ -498,17 +535,13 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
     switch (fdwReason) {
     case DLL_PROCESS_ATTACH:
         DisableThreadLibraryCalls(hinstDLL);
-        {
-            FILE* f = fopen(DEBUG_LOG, "w");
-            if (f) {
-                fprintf(f, "mcicda.dll loaded - waveOut direct playback\n");
-                fclose(f);
-            }
-        }
         break;
     case DLL_PROCESS_DETACH:
-        DebugLog("DLL unloading");
         StopPlayback();
+        if (g_hWinMM) {
+            FreeLibrary(g_hWinMM);
+            g_hWinMM = NULL;
+        }
         break;
     }
     return TRUE;
