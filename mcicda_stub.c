@@ -1,7 +1,7 @@
 /*
  * MCI CD Audio Driver with Direct Multi-Format Playback
  * Intercepts CD audio commands and plays audio files using waveOut API.
- * Supports WAV, FLAC, MP3, and OGG Vorbis via single-header decoders.
+ * Supports WAV, FLAC, MP3, OGG Vorbis, and Opus.
  * Uses dynamic loading of winmm.dll to avoid import issues.
  */
 
@@ -23,6 +23,8 @@
 
 #include "stb_vorbis.c"
 
+#include <opusfile.h>
+
 /* Internal MCI driver message IDs */
 #ifndef MCI_OPEN_DRIVER
 #define MCI_OPEN_DRIVER 0x0801
@@ -41,11 +43,12 @@ typedef enum {
     AUDIO_FMT_WAV,
     AUDIO_FMT_FLAC,
     AUDIO_FMT_MP3,
-    AUDIO_FMT_OGG
+    AUDIO_FMT_OGG,
+    AUDIO_FMT_OPUS
 } AudioFormat;
 
-static const char* g_extensions[] = { ".wav", ".flac", ".mp3", ".ogg", NULL };
-static const AudioFormat g_formats[] = { AUDIO_FMT_WAV, AUDIO_FMT_FLAC, AUDIO_FMT_MP3, AUDIO_FMT_OGG };
+static const char* g_extensions[] = { ".wav", ".flac", ".mp3", ".ogg", ".opus", NULL };
+static const AudioFormat g_formats[] = { AUDIO_FMT_WAV, AUDIO_FMT_FLAC, AUDIO_FMT_MP3, AUDIO_FMT_OGG, AUDIO_FMT_OPUS };
 
 /* Device state */
 static BOOL g_bOpen = FALSE;
@@ -202,6 +205,43 @@ static short* DecodeAudioFile(const char* path, AudioFormat fmt,
             *sampleRate = (unsigned int)sr;
             *totalSamples = (size_t)sampleFrames * (size_t)ch;
             LogCommand("Decoded OGG: %uch %uHz, %d frames", *channels, *sampleRate, sampleFrames);
+        }
+        break;
+    }
+    case AUDIO_FMT_OPUS: {
+        int error = 0;
+        OggOpusFile* of = op_open_file(path, &error);
+        if (of) {
+            ogg_int64_t totalPcmFrames = op_pcm_total(of, -1);
+            int ch = op_channel_count(of, -1);
+            /* Opus always decodes at 48000 Hz */
+            unsigned int sr = 48000;
+            if (totalPcmFrames > 0 && ch > 0) {
+                size_t totalSamp = (size_t)totalPcmFrames * (size_t)ch;
+                short* buf = (short*)malloc(totalSamp * sizeof(short));
+                if (buf) {
+                    size_t filled = 0;
+                    int link_index;
+                    while (filled < totalSamp) {
+                        int ret = op_read(of, buf + filled, (int)(totalSamp - filled), &link_index);
+                        if (ret <= 0) break;
+                        filled += (size_t)ret * (size_t)ch;
+                    }
+                    if (filled > 0) {
+                        pcm = buf;
+                        *channels = (unsigned int)ch;
+                        *sampleRate = sr;
+                        *totalSamples = filled;
+                        LogCommand("Decoded Opus: %uch %uHz, %llu frames", *channels, *sampleRate,
+                                   (unsigned long long)(filled / ch));
+                    } else {
+                        free(buf);
+                    }
+                }
+            }
+            op_free(of);
+        } else {
+            LogCommand("ERROR: op_open_file failed (%d)", error);
         }
         break;
     }
