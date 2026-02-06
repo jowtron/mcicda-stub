@@ -7,6 +7,7 @@
 #include <windows.h>
 #include <mmsystem.h>
 #include <stdio.h>
+#include <stdarg.h>
 
 /* Internal MCI driver message IDs (not in standard headers) */
 #ifndef MCI_OPEN_DRIVER
@@ -18,6 +19,23 @@
 
 /* Music directory - where track files are stored */
 #define MUSIC_DIR "C:\\music\\"
+
+/* Debug log file */
+#define DEBUG_LOG "C:\\mcicda_debug.log"
+
+static void DebugLog(const char* fmt, ...)
+{
+    FILE* f = fopen(DEBUG_LOG, "a");
+    if (f) {
+        va_list args;
+        va_start(args, fmt);
+        vfprintf(f, fmt, args);
+        va_end(args);
+        fprintf(f, "\n");
+        fflush(f);
+        fclose(f);
+    }
+}
 
 /* Device state */
 static BOOL g_bOpen = FALSE;
@@ -63,17 +81,23 @@ static BOOL PlayTrack(DWORD track)
     MCI_OPEN_PARMSA openParms;
     MCI_PLAY_PARMS playParms;
     MCIERROR err;
+    char errBuf[256];
+
+    DebugLog("PlayTrack called for track %d", track);
 
     /* Stop any current playback */
     StopPlayback();
 
     /* Build track path */
     GetTrackPath(track, path, MAX_PATH);
+    DebugLog("Track path: %s", path);
 
     /* Check if file exists */
     if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) {
+        DebugLog("ERROR: File not found: %s (error %d)", path, GetLastError());
         return FALSE;
     }
+    DebugLog("File exists");
 
     /* Open the wave file */
     ZeroMemory(&openParms, sizeof(openParms));
@@ -85,20 +109,27 @@ static BOOL PlayTrack(DWORD track)
         (DWORD_PTR)&openParms);
 
     if (err != 0) {
+        mciGetErrorStringA(err, errBuf, sizeof(errBuf));
+        DebugLog("ERROR: MCI_OPEN failed: %s (code %d)", errBuf, err);
         return FALSE;
     }
 
     g_waveDeviceId = openParms.wDeviceID;
+    DebugLog("MCI_OPEN success, deviceId=%d", g_waveDeviceId);
 
     /* Start playback */
     ZeroMemory(&playParms, sizeof(playParms));
     err = mciSendCommand(g_waveDeviceId, MCI_PLAY, 0, (DWORD_PTR)&playParms);
 
     if (err != 0) {
+        mciGetErrorStringA(err, errBuf, sizeof(errBuf));
+        DebugLog("ERROR: MCI_PLAY failed: %s (code %d)", errBuf, err);
         mciSendCommand(g_waveDeviceId, MCI_CLOSE, 0, 0);
         g_waveDeviceId = 0;
         return FALSE;
     }
+
+    DebugLog("MCI_PLAY success - audio should be playing");
 
     g_dwCurrentTrack = track;
     g_bPlaying = TRUE;
@@ -168,6 +199,7 @@ LRESULT CALLBACK DriverProc(DWORD_PTR dwDriverId, HDRVR hDriver, UINT msg,
     if (msg == MCI_OPEN_DRIVER) {
         g_bOpen = TRUE;
         g_dwNumTracks = CountTracks();
+        DebugLog("MCI_OPEN_DRIVER: device opened, %d tracks found", g_dwNumTracks);
         return 0;
     }
 
@@ -193,12 +225,15 @@ LRESULT CALLBACK DriverProc(DWORD_PTR dwDriverId, HDRVR hDriver, UINT msg,
         {
             DWORD dwFrom = g_dwCurrentTrack;
 
+            DebugLog("MCI_PLAY received, flags=0x%08X", lParam1);
+
             if (lParam1 & MCI_FROM) {
                 MCI_PLAY_PARMS* parms = (MCI_PLAY_PARMS*)lParam2;
                 if (g_dwTimeFormat == MCI_FORMAT_TMSF)
                     dwFrom = MCI_TMSF_TRACK(parms->dwFrom);
                 else
                     dwFrom = parms->dwFrom;
+                DebugLog("MCI_FROM specified: track %d", dwFrom);
             }
 
             PlayTrack(dwFrom);
@@ -336,8 +371,17 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
     switch (fdwReason) {
     case DLL_PROCESS_ATTACH:
         DisableThreadLibraryCalls(hinstDLL);
+        /* Clear debug log */
+        {
+            FILE* f = fopen(DEBUG_LOG, "w");
+            if (f) {
+                fprintf(f, "mcicda.dll loaded - direct audio playback version\n");
+                fclose(f);
+            }
+        }
         break;
     case DLL_PROCESS_DETACH:
+        DebugLog("DLL unloading");
         StopPlayback();
         break;
     }
