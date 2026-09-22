@@ -36,7 +36,7 @@ For each track, the DLL searches for files in priority order: `.wav`, `.flac`, `
 
 ### 1. Get the DLL
 
-Download `mcicda.dll` from the [GitHub Actions](https://github.com/jowtron/mcicda-stub/actions) build artifacts, or build it yourself (see below).
+Download `mcicda.dll` from the [latest release](https://github.com/jowtron/mcicda-stub/releases/latest), or build it yourself (see below).
 
 ### 2. Place audio files
 
@@ -92,7 +92,7 @@ The built DLL will be in `build/Release/mcicda.dll`.
 
 ### GitHub Actions
 
-This repo includes a GitHub Actions workflow that builds on every push. Download the artifact from the [Actions tab](https://github.com/jowtron/mcicda-stub/actions).
+This repo includes a GitHub Actions workflow that builds on every push. Artifacts from the [Actions tab](https://github.com/jowtron/mcicda-stub/actions) expire after 30 days; tagged builds are attached to [Releases](https://github.com/jowtron/mcicda-stub/releases).
 
 ## Debugging
 
@@ -131,7 +131,7 @@ MCI_OPEN, MCI_CLOSE, MCI_PLAY, MCI_STOP, MCI_PAUSE, MCI_RESUME, MCI_SEEK, MCI_ST
 
 MIT License -- See LICENSE file.
 
-Audio decoder libraries are public domain (dr_libs, stb_vorbis) and BSD-licensed (libogg, libopus, opusfile).
+Audio decoder libraries are public domain (dr_libs, stb_vorbis) and BSD-licensed (libogg, libopus, opusfile; see `deps/*/COPYING`).
 
 ## Contributing
 
